@@ -292,7 +292,8 @@ static RVReadInfo fmplayer_plugin_read_data(void* user_data, RVReadData dest) {
     }
 
     // Calculate output frames at OPNA native rate
-    uint32_t out_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    uint32_t capacity_frames = dest.channels_output_max_bytes_size / (sizeof(int16_t) * 2);
+    uint32_t out_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
 
     // Generate audio at OPNA native rate (55467 Hz, stereo S16) directly to output
     int16_t* output = (int16_t*)dest.channels_output;
