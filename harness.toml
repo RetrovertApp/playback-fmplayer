@@ -1,0 +1,9 @@
+[plugin]
+name = "fmplayer"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/retrovert_selftest.opi"
+sha256 = "c23e622e38c0e6a70745e010b0898f61dbe05c0d3abd04f46470604e0544f2b9"

@@ -68,27 +68,32 @@ typedef struct FmplayerData {
 // OPNA callback wrappers for fmdriver_work
 //
 // These callbacks receive (struct fmdriver_work *work) as first arg.
-// We use work->opna (void*) to get back to the OPNA instance.
+// work->opna holds the opna_timer, not the bare OPNA: register writes must
+// pass through the timer so that the driver's writes to the timer registers
+// (0x24-0x27) actually arm it. Writing straight to the OPNA left the timer
+// unprogrammed, no interrupt ever fired, and every song decoded to silence.
 
 static void fmplayer_opna_writereg(struct fmdriver_work* work, unsigned addr, unsigned data) {
-    struct opna* opna = (struct opna*)work->opna;
-    opna_writereg(opna, addr, data);
+    struct opna_timer* timer = (struct opna_timer*)work->opna;
+    opna_timer_writereg(timer, addr, data);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static unsigned fmplayer_opna_readreg(struct fmdriver_work* work, unsigned addr) {
-    struct opna* opna = (struct opna*)work->opna;
-    return opna_readreg(opna, addr);
+    struct opna_timer* timer = (struct opna_timer*)work->opna;
+    return opna_readreg(timer->opna, addr);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static uint8_t fmplayer_opna_status(struct fmdriver_work* work, bool a1) {
-    (void)a1;
-    struct opna* opna = (struct opna*)work->opna;
-    // Status register: return timer flags
-    return (uint8_t)(opna_readreg(opna, 0) & 0x03);
+    struct opna_timer* timer = (struct opna_timer*)work->opna;
+    uint8_t status = opna_timer_status(timer);
+    if (!a1) {
+        status &= 0x83;
+    }
+    return status;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -157,8 +162,8 @@ static void fmplayer_init_opna(FmplayerData* data) {
 
     memset(&data->work, 0, sizeof(data->work));
 
-    // Store OPNA pointer in work struct for callback access
-    data->work.opna = &data->opna;
+    // The callbacks above expect the timer here, not the bare OPNA.
+    data->work.opna = &data->timer;
 
     // Wire OPNA register access callbacks
     data->work.opna_writereg = fmplayer_opna_writereg;
