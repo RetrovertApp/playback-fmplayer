@@ -53,6 +53,11 @@ target_include_directories(fmplayer_static PUBLIC
     ${FMPLAYER_ROOT}/fmdriver
 )
 
+# libopna's per-track oscilloscope capture is compiled out unless this is
+# defined. It is what backs the plugin's scope channels; PUBLIC so the plugin
+# translation unit agrees with the library about struct oscillodata's use.
+target_compile_definitions(fmplayer_static PUBLIC LIBOPNA_ENABLE_OSCILLO)
+
 suppress_external_warnings(fmplayer_static)
 set_target_properties(fmplayer_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

@@ -23,9 +23,11 @@
 #include "opnaadpcm.h"
 #include "opnadrum.h"
 #include "opnatimer.h"
+#include "oscillo/oscillo.h"
 #include "ppz8.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,6 +42,12 @@
 // OPNA native output rate (7987200 Hz master clock / 144)
 // OPNA native output rate (7987200 Hz master clock / 144)
 #define OPNA_RATE 55467
+
+// libopna captures FM channels 1-6 into oscillo tracks 0-5 and SSG A/B/C into
+// 6-8. Tracks 9 and 10 exist in LIBOPNA_OSCILLO_TRACK_COUNT but nothing writes
+// them -- the rhythm and ADPCM mixers take no oscillo argument -- so they are
+// not offered as scope channels.
+#define FMPLAYER_SCOPE_CHANNELS 9
 // Default song length (4 minutes) since FMP files don't embed duration
 #define DEFAULT_LENGTH_MS (4 * 60 * 1000)
 // PPZ8 mix volume (from 98fmplayer reference)
@@ -62,6 +70,12 @@ typedef struct FmplayerData {
     int file_open;
     int elapsed_frames; // Output frames elapsed (at OPNA_RATE)
     int max_frames;     // Max output frames before song ends (at OPNA_RATE)
+    // Per-track scope capture, filled by libopna during the mix. Only written
+    // while the host has the scope switched on: each mix call memmoves the
+    // whole 8192-sample window of every track, which is not worth paying for
+    // when nothing is drawing it.
+    struct oscillodata oscillo[LIBOPNA_OSCILLO_TRACK_COUNT];
+    bool scope_enabled;
 } FmplayerData;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -303,7 +317,21 @@ static RVReadInfo fmplayer_plugin_read_data(void* user_data, RVReadData dest) {
     // Generate audio at OPNA native rate (55467 Hz, stereo S16) directly to output
     int16_t* output = (int16_t*)dest.channels_output;
     memset(output, 0, out_frames * 2 * sizeof(int16_t));
-    opna_timer_mix(&data->timer, output, out_frames);
+    if (data->scope_enabled) {
+        // The capture window is OSCILLO_SAMPLE_COUNT long and libopna shifts it
+        // by the mix size, so a single mix must never exceed the window.
+        uint32_t done = 0;
+        while (done < out_frames) {
+            uint32_t chunk = out_frames - done;
+            if (chunk > OSCILLO_SAMPLE_COUNT) {
+                chunk = OSCILLO_SAMPLE_COUNT;
+            }
+            opna_timer_mix_oscillo(&data->timer, output + (size_t)done * 2, chunk, data->oscillo);
+            done += chunk;
+        }
+    } else {
+        opna_timer_mix(&data->timer, output, out_frames);
+    }
 
     data->elapsed_frames += (int)out_frames;
 
@@ -353,6 +381,118 @@ static void fmplayer_plugin_static_init(const RVService* service_api) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Visualization.
+//
+// libopna keeps a per-track oscilloscope window that the mix appends to, so the
+// scope comes straight from the chip emulation rather than from any post-mix
+// analysis. FMP/PMD pattern state lives in fmdriver_work, but it is a driver
+// scratch area rather than a pattern grid, so only the scope is offered.
+
+static bool fmplayer_plugin_get_structure(void* user_data, RVVizInfo* out) {
+    FmplayerData* data = (FmplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return false;
+    }
+
+    out->caps = RVVizCaps_Scope | RVVizCaps_Vu;
+    out->scroll_mode = RVScrollMode_Synchronized;
+    out->pattern_channel_count = 0;
+    out->scope_channel_count = FMPLAYER_SCOPE_CHANNELS;
+    out->column_count = 0;
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t fmplayer_plugin_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    (void)user_data;
+    if (out == nullptr) {
+        return 0;
+    }
+
+    static const char* s_names[FMPLAYER_SCOPE_CHANNELS] = {
+        "FM 1", "FM 2", "FM 3", "FM 4", "FM 5", "FM 6", "SSG A", "SSG B", "SSG C",
+    };
+
+    uint32_t count = FMPLAYER_SCOPE_CHANNELS < cap ? FMPLAYER_SCOPE_CHANNELS : cap;
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "%s", s_names[i]);
+        out[i].scope_width = 1;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void fmplayer_plugin_set_scope_enabled(void* user_data, bool on) {
+    FmplayerData* data = (FmplayerData*)user_data;
+    if (data == nullptr) {
+        return;
+    }
+
+    if (on && !data->scope_enabled) {
+        // Start from silence rather than from whatever the last enabled run left.
+        memset(data->oscillo, 0, sizeof(data->oscillo));
+    }
+    data->scope_enabled = on;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t fmplayer_plugin_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
+    FmplayerData* data = (FmplayerData*)user_data;
+    if (data == nullptr || out == nullptr || !data->scope_enabled) {
+        return 0;
+    }
+    if (channel < 0 || channel >= FMPLAYER_SCOPE_CHANNELS) {
+        return 0;
+    }
+
+    // The window slides left as samples are mixed, so the newest are at the end.
+    uint32_t count = cap < OSCILLO_SAMPLE_COUNT ? cap : OSCILLO_SAMPLE_COUNT;
+    const int16_t* tail = &data->oscillo[channel].buf[OSCILLO_SAMPLE_COUNT - count];
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = (float)tail[i] * (1.0f / 32768.0f);
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t fmplayer_plugin_get_vu(void* user_data, float* out, uint32_t cap) {
+    FmplayerData* data = (FmplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    // One OPNA frame at 55467 Hz is ~925 samples; a shorter window than that
+    // tracks note attacks without the meter hanging on to old peaks.
+    enum { VU_WINDOW = 512 };
+
+    // The host checks this against the declared scope channel count on every
+    // captured frame, so it must report the full count even with the capture
+    // switched off -- silent levels, not a short read.
+    uint32_t count = FMPLAYER_SCOPE_CHANNELS < cap ? FMPLAYER_SCOPE_CHANNELS : cap;
+    for (uint32_t c = 0; c < count; c++) {
+        if (!data->scope_enabled) {
+            out[c] = 0.0f;
+            continue;
+        }
+        const int16_t* tail = &data->oscillo[c].buf[OSCILLO_SAMPLE_COUNT - VU_WINDOW];
+        int32_t peak = 0;
+        for (uint32_t i = 0; i < VU_WINDOW; i++) {
+            int32_t v = tail[i] < 0 ? -(int32_t)tail[i] : (int32_t)tail[i];
+            if (v > peak) {
+                peak = v;
+            }
+        }
+        out[c] = (float)peak * (1.0f / 32768.0f);
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static RVPlaybackPlugin g_fmplayer_plugin = {
     RV_PLAYBACK_PLUGIN_API_VERSION,
@@ -373,17 +513,17 @@ static RVPlaybackPlugin g_fmplayer_plugin = {
     nullptr, // settings_updated
     nullptr, // static_destroy
 
-    // Visualization: none (caps = 0; pure decoder, no pattern grid or scope).
-    nullptr, // get_structure
+    // Visualization: per-track scope and VU over the OPNA's FM and SSG channels.
+    fmplayer_plugin_get_structure,
     nullptr, // get_columns
     nullptr, // get_pattern_channels
-    nullptr, // get_scope_channels
+    fmplayer_plugin_get_scope_channels,
     nullptr, // get_position
     nullptr, // get_channel_rows
     nullptr, // get_cells
-    nullptr, // set_scope_enabled
-    nullptr, // get_scope_samples
-    nullptr, // get_vu
+    fmplayer_plugin_set_scope_enabled,
+    fmplayer_plugin_get_scope_samples,
+    fmplayer_plugin_get_vu,
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
